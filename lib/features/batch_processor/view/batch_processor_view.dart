@@ -57,18 +57,22 @@ class _BatchProcessorViewState extends State<BatchProcessorView> {
         setState(() {
           _isolateReady = true;
         });
-      } else if (message is ProcessResult) {
-        // Handle a processed image result
-        setState(() {
-          _processedImages.add(message.processedImage);
-          _processingImages.remove(message.imageId);
-          _progressMap.remove(message.imageId);
-        });
-      } else if (message is Map) {
-        // Handle progress updates
-        if (message.containsKey('progress') && message.containsKey('imageId')) {
+      } else if (message is List<dynamic> && message.length == 2) {
+        // Handle results - comes as [Uint8List, int]
+        if (message[0] is Uint8List && message[1] is int) {
           setState(() {
-            _progressMap[message['imageId']] = message['progress'];
+            _processedImages.add(message[0] as Uint8List);
+            _processingImages.remove(message[1]);
+            _progressMap.remove(message[1]);
+          });
+        }
+      } else if (message is List<dynamic> && message.length == 3) {
+        // Handle progress - comes as ["progress", imageId, progressValue]
+        if (message[0] == "progress" &&
+            message[1] is int &&
+            message[2] is double) {
+          setState(() {
+            _progressMap[message[1]] = message[2];
           });
         }
       }
@@ -87,6 +91,7 @@ class _BatchProcessorViewState extends State<BatchProcessorView> {
     final List<XFile> images = await _picker.pickMultiImage();
     if (images.isNotEmpty) {
       setState(() {
+        _selectedImages.clear();
         _selectedImages.addAll(images);
       });
     }
@@ -103,13 +108,7 @@ class _BatchProcessorViewState extends State<BatchProcessorView> {
       final Uint8List imageData = await image.readAsBytes();
 
       // Send the image to the isolate for processing
-      _sendPort!.send(
-        IsolateMessage(
-          imageData: imageData,
-          filterId: _selectedFilter,
-          imageId: i,
-        ),
-      );
+      _sendPort!.send(["process", imageData, _selectedFilter, i]);
 
       setState(() {
         _processingImages.add(i);
@@ -244,28 +243,40 @@ class _BatchProcessorViewState extends State<BatchProcessorView> {
       ),
     );
   }
+}
 
-  // Isolate entry point
-  void _isolateEntryPoint(SendPort mainSendPort) {
-    // Create a receive port for incoming messages
-    final ReceivePort receivePort = ReceivePort();
-    mainSendPort.send(receivePort.sendPort);
+// Isolate entry point - must be a top-level function
+void _isolateEntryPoint(SendPort mainSendPort) {
+  // Create a receive port for incoming messages
+  final ReceivePort receivePort = ReceivePort();
+  mainSendPort.send(receivePort.sendPort);
 
-    bool isPaused = false;
-    final List<IsolateMessage> queue = [];
+  bool isPaused = false;
+  final List<List<dynamic>> queue = [];
 
-    // Listen for messages from the main isolate
-    receivePort.listen((message) {
-      if (message is IsolateMessage) {
+  // Listen for messages from the main isolate
+  receivePort.listen((message) {
+    // Messages are sent as lists for simplicity and type safety
+
+    if (message is List<dynamic>) {
+      final String type = message[0] as String;
+
+      if (type == "process") {
+        final Uint8List imageData = message[1] as Uint8List;
+        final String filterId = message[2] as String;
+        final int imageId = message[3] as int;
+
         if (isPaused) {
           // If paused, add to queue
           queue.add(message);
         } else {
           // Otherwise process immediately
-          _processImage(message, mainSendPort);
+          _processImage(imageData, filterId, imageId, mainSendPort);
         }
-      } else if (message is Map && message.containsKey('command')) {
-        switch (message['command']) {
+      } else if (type == "command") {
+        final String command = message[1] as String;
+
+        switch (command) {
           case 'pause':
             isPaused = true;
             break;
@@ -273,8 +284,11 @@ class _BatchProcessorViewState extends State<BatchProcessorView> {
             isPaused = false;
             // Process queued images
             while (!isPaused && queue.isNotEmpty) {
-              final item = queue.removeAt(0);
-              _processImage(item, mainSendPort);
+              final List<dynamic> item = queue.removeAt(0);
+              final Uint8List imageData = item[1] as Uint8List;
+              final String filterId = item[2] as String;
+              final int imageId = item[3] as int;
+              _processImage(imageData, filterId, imageId, mainSendPort);
             }
             break;
           case 'cancel':
@@ -282,66 +296,69 @@ class _BatchProcessorViewState extends State<BatchProcessorView> {
             break;
         }
       }
-    });
-  }
-
-  // Function to process an image
-  Future<void> _processImage(IsolateMessage message, SendPort sendPort) async {
-    try {
-      // Decode image
-      final img.Image? image = img.decodeImage(message.imageData);
-      if (image == null) return;
-
-      // Apply selected filter with simulated progress updates
-      img.Image processedImage;
-
-      switch (message.filterId) {
-        case 'blur':
-          //Simulate a slow processs with progress updates
-          for (int i = 1; i <= 10; i++) {
-            await Future.delayed(const Duration(milliseconds: 200));
-            sendPort.send({'progress': i / 10, 'imageId': message.imageId});
-          }
-          processedImage = img.gaussianBlur(image, radius: 10);
-
-          break;
-
-        case 'grayscale':
-          for (int i = 1; i <= 10; i++) {
-            await Future.delayed(const Duration(milliseconds: 100));
-            sendPort.send({'imageId': message.imageId, 'progress': i / 10});
-          }
-          processedImage = img.grayscale(image);
-          break;
-
-        case 'sepia':
-          for (int i = 1; i <= 10; i++) {
-            await Future.delayed(const Duration(milliseconds: 150));
-            sendPort.send({'imageId': message.imageId, 'progress': i / 10});
-          }
-          processedImage = img.sepia(image);
-          break;
-
-        case 'pixelate':
-          for (int i = 1; i <= 10; i++) {
-            await Future.delayed(const Duration(milliseconds: 250));
-            sendPort.send({'imageId': message.imageId, 'progress': i / 10});
-          }
-          processedImage = img.pixelate(image, size: 8);
-          break;
-        default:
-          processedImage = image;
-      }
-
-      // Encode the processed image and send it back
-      final Uint8List processedBytes = Uint8List.fromList(
-        img.encodeJpg(processedImage),
-      );
-      sendPort.send(
-        ProcessResult(processedImage: processedBytes, imageId: message.imageId),
-      );
-    } catch (e) {
-      print('Error processing image: $e');
     }
+  });
+}
+
+// Function to process an image
+Future<void> _processImage(
+  Uint8List imageData,
+  String filterId,
+  int imageId,
+  SendPort sendPort,
+) async {
+  try {
+    // Decode image
+    final img.Image? image = img.decodeImage(imageData);
+    if (image == null) return;
+
+    // Apply selected filter with simulated progress updates
+    img.Image processedImage;
+
+    switch (filterId) {
+      case 'blur':
+        //Simulate a slow processs with progress updates
+        for (int i = 1; i <= 10; i++) {
+          await Future.delayed(const Duration(milliseconds: 200));
+          sendPort.send(["progress", imageId, i / 10]);
+        }
+        processedImage = img.gaussianBlur(image, radius: 10);
+
+        break;
+
+      case 'grayscale':
+        for (int i = 1; i <= 10; i++) {
+          await Future.delayed(const Duration(milliseconds: 100));
+          sendPort.send(["progress", imageId, i / 10]);
+        }
+        processedImage = img.grayscale(image);
+        break;
+
+      case 'sepia':
+        for (int i = 1; i <= 10; i++) {
+          await Future.delayed(const Duration(milliseconds: 150));
+          sendPort.send(["progress", imageId, i / 10]);
+        }
+        processedImage = img.sepia(image);
+        break;
+
+      case 'pixelate':
+        for (int i = 1; i <= 10; i++) {
+          await Future.delayed(const Duration(milliseconds: 250));
+          sendPort.send(["progress", imageId, i / 10]);
+        }
+        processedImage = img.pixelate(image, size: 8);
+        break;
+      default:
+        processedImage = image;
+    }
+
+    // Encode the processed image and send it back
+    final Uint8List processedBytes = Uint8List.fromList(
+      img.encodeJpg(processedImage),
+    );
+    sendPort.send([processedBytes, imageId]);
+  } catch (e) {
+    print('Error processing image: $e');
   }
 }
